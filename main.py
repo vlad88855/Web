@@ -4,16 +4,15 @@ import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import RedirectResponse, JSONResponse, HTMLResponse
 from jose import jwt
+import json
 
 app = FastAPI()
 
-CASDOOR_URL = "https://localhost:444"  # URL Casdoor (HTTP для внутрішніх запитів)
+CASDOOR_URL = "https://localhost:444"
 CLIENT_ID = "e05d3d2637bc42897b76"
-CLIENT_SECRET = ""
+CLIENT_SECRET = "97184187984581f9142c4ab98ff6033f1249ad43"
 REDIRECT_URI = "https://localhost/callback"
-ORG_NAME = "ordinary-users"
-APP_NAME = "app-lab3"
-
+JWKS_URL = f"{CASDOOR_URL}/.well-known/jwks"
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
@@ -74,7 +73,6 @@ async def hello():
         </head>
         <body>
             <div class="container">
-                <div style="font-size: 50px;">🎉</div>
                 <h1>Login Successful!</h1>
                 <p>OIDC handshake completed. Your session is now active and protected by a Secure HttpOnly cookie.</p>
 
@@ -108,48 +106,94 @@ async def callback(code: str):
         "client_id": CLIENT_ID,
         "client_secret": CLIENT_SECRET,
         "code": code,
+        "redirect_uri": REDIRECT_URI,
     }
 
     async with httpx.AsyncClient(verify=False) as client:
         response = await client.post(token_url, data=data)
         if response.status_code != 200:
+            print(f"Casdoor error: {response.text}")
             raise HTTPException(status_code=400, detail="Failed to get token from Casdoor")
 
         token_data = response.json()
         access_token = token_data.get("access_token")
 
         response = RedirectResponse(url="/hello")
-        response.set_cookie(key="auth_token", value=access_token, httponly=True, secure=True)
+        response.set_cookie(key="auth_token", value=access_token, httponly=True, secure=True, samesite='lax')
         return response
 
 
-@app.get("/user-info")
+@app.get("/user-info", response_class=HTMLResponse)
 async def user_info(request: Request):
     token = request.cookies.get("auth_token")
-
     if not token:
         raise HTTPException(status_code=401, detail="Unauthorized: No token provided")
 
-    userinfo_url = f"{CASDOOR_URL}/api/userinfo?accessToken={token}"
-
     async with httpx.AsyncClient(verify=False) as client:
-        response = await client.get(userinfo_url)
-        if response.status_code != 200:
-            raise HTTPException(status_code=401, detail="Unauthorized: Invalid token")
+        jwks_response = await client.get(JWKS_URL)
+        if jwks_response.status_code != 200:
+            raise HTTPException(status_code=500, detail="Could not fetch JWKS")
+        jwks = jwks_response.json()
 
-        return response.json()
+    try:
+        header = jwt.get_unverified_header(token)
+        kid = header.get("kid")
 
-@app.get("/hello")
-async def hello():
-    return "Hello from Vlad Shynkaruk КP-33. Login successful!"
+        rsa_key = None
+        for key in jwks.get("keys", []):
+            if key.get("kid") == kid:
+                rsa_key = key
+                break
+
+        if not rsa_key:
+            raise HTTPException(status_code=401, detail=f"Key {kid} not found.")
+
+        payload = jwt.decode(
+            token,
+            rsa_key,
+            algorithms=['RS256'],
+            audience=CLIENT_ID,
+            options={"verify_at_hash": False}
+        )
+
+        pretty_payload = json.dumps(payload, indent=4, ensure_ascii=False)
+
+        html_content = f"""
+        <html>
+            <head>
+                <title>User Profile</title>
+                <style>
+                    body {{ font-family: 'Segoe UI', Tahoma, sans-serif; display: flex; justify-content: center; background-color: #f4f7f6; padding: 40px; margin: 0; }}
+                    .container {{ background: white; padding: 30px; border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.1); width: 100%; max-width: 600px; }}
+                    h1 {{ color: #333; border-bottom: 2px solid #eee; padding-bottom: 10px; }}
+                    pre {{ background: #282c34; color: #abb2bf; padding: 15px; border-radius: 8px; overflow-x: auto; font-family: Consolas, monospace; font-size: 14px; }}
+                    .btn {{ display: inline-block; padding: 10px 20px; background-color: #6c757d; color: white; text-decoration: none; border-radius: 6px; margin-top: 15px; transition: 0.2s; }}
+                    .btn:hover {{ background-color: #5a6268; }}
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1>User Profile</h1>
+                    <p>Hello, <strong>{payload.get('displayName', 'User')}</strong>!</p>
+                    <p><strong>Email:</strong> {payload.get('email', 'N/A')}</p>
+
+                    <h3>Decoded JWT Token:</h3>
+                    <pre>{pretty_payload}</pre>
+
+                    <a href="/hello" class="btn">Back</a>
+                </div>
+            </body>
+        </html>
+        """
+        return html_content
+
+    except Exception as e:
+        print(f"JWT Validation Error: {str(e)}")
+        raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
 
 if __name__ == "__main__":
     uvicorn.run(
         app,
         host="127.0.0.1",
-        port=443,
-        ssl_certfile="localhost+1.pem",
-        ssl_keyfile="localhost+1-key.pem",
-        ssl_version=ssl.PROTOCOL_TLSv1_2,
-        ssl_ciphers="AES128-SHA:AES256-SHA"
+        port=8080
     )
