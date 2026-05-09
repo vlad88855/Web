@@ -3,9 +3,13 @@ import uvicorn
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import RedirectResponse, JSONResponse, HTMLResponse
-from jose import jwt
+from jose import jwt, JWTError
 import json
-
+#lab 4 additional
+import asyncio
+import websockets
+from fastapi import WebSocket, WebSocketDisconnect
+import message_pb2
 app = FastAPI()
 
 CASDOOR_URL = "https://localhost:444"
@@ -79,6 +83,7 @@ async def hello():
                 <div class="actions">
                     <a href="/user-info" class="btn btn-primary">Check My Profile (User Info)</a>
                     <a href="/" class="btn btn-outline">Return to Main Page</a>
+                    <a href="/realtime" class="btn" style="background-color: #ff9800; color: white;">Real-time Crypto Monitor</a>
                 </div>
             </div>
         </body>
@@ -190,6 +195,162 @@ async def user_info(request: Request):
     except Exception as e:
         print(f"JWT Validation Error: {str(e)}")
         raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
+
+
+# LAB 4
+
+
+@app.get("/realtime", response_class=HTMLResponse)
+async def realtime():
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Real-time Crypto</title>
+        <script src="https://cdn.jsdelivr.net/npm/protobufjs@7.2.5/dist/protobuf.min.js"></script>
+    </head>
+    <body>
+        <h2>Live Crypto Prices</h2>
+        <input type="text" id="symbolInput" placeholder="BTCUSDT">
+        <button onclick="subscribe()">Subscribe</button>
+        <ul id="messages"></ul>
+    
+        <script>
+            let ws;
+            let CoinUpdate;
+    
+            const protoStr = `
+            syntax = "proto3";
+            message CoinUpdate {
+                string symbol = 1;
+                string price = 2;
+            }`;
+    
+            protobuf.parse.filename = "message.proto";
+            const parsed = protobuf.parse(protoStr);
+            const root = parsed.root;
+            CoinUpdate = root.lookupType("CoinUpdate");
+    
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(protocol + '//' + window.location.host + '/ws');
+            ws.binaryType = "arraybuffer"; // Обов'язково для Protobuf
+    
+            ws.onmessage = function(event) {
+                const buffer = new Uint8Array(event.data);
+                const message = CoinUpdate.decode(buffer);
+                
+                const li = document.createElement('li');
+                li.textContent = message.symbol + ": " + message.price;
+                document.getElementById('messages').appendChild(li);
+            };
+    
+            function subscribe() {
+                const symbol = document.getElementById("symbolInput").value;
+                ws.send(symbol); // Відправляємо інфу про види ресурсів
+            }
+        </script>
+    </body>
+    </html>"""
+
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: list[dict] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append({"ws": websocket, "subs": set()})
+
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections = [c for c in self.active_connections if c["ws"] != websocket]
+
+    def subscribe(self, websocket: WebSocket, symbol: str):
+        for c in self.active_connections:
+            if c["ws"] == websocket:
+                c["subs"].add(symbol.upper())
+
+    async def broadcast(self, symbol: str, price: str):
+        update = message_pb2.CoinUpdate(symbol=symbol, price=price)
+        serialized_data = update.SerializeToString()
+
+        for connection in self.active_connections:
+            if symbol in connection["subs"]:
+                try:
+                    await connection["ws"].send_bytes(serialized_data)
+                except:
+                    pass
+
+
+manager = ConnectionManager()
+
+subscription_queue = asyncio.Queue()
+
+async def binance_listener():
+    uri = "wss://stream.binance.com:9443/ws"
+    async with websockets.connect(uri) as binance_ws:
+
+        async def handle_subscriptions():
+            while True:
+                symbol = await subscription_queue.get()
+                subscribe_msg = {
+                    "method": "SUBSCRIBE",
+                    "params": [f"{symbol.lower()}@trade"],
+                    "id": 1
+                }
+                await binance_ws.send(json.dumps(subscribe_msg))
+
+        asyncio.create_task(handle_subscriptions())
+
+        while True:
+            message = await binance_ws.recv()
+            data = json.loads(message)
+            if "result" not in data:
+                symbol = data.get("s")
+                price = data.get("p")
+                if symbol and price:
+                    await manager.broadcast(symbol, price)
+
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(binance_listener())
+
+async def validate_token(token: str):
+    async with httpx.AsyncClient(verify=False) as client:
+        jwks_response = await client.get(JWKS_URL)
+        jwks = jwks_response.json()
+
+    header = jwt.get_unverified_header(token)
+    kid = header.get("kid")
+    rsa_key = next((key for key in jwks.get("keys", []) if key.get("kid") == kid), None)
+
+    if not rsa_key:
+        raise ValueError("Key not found")
+
+    return jwt.decode(token, rsa_key, algorithms=['RS256'], audience=CLIENT_ID, options={"verify_at_hash": False})
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    token = websocket.cookies.get("auth_token")
+    if not token:
+        await websocket.close(code=1008)
+        return
+
+    try:
+        await validate_token(token)
+    except Exception:
+        await websocket.close(code=1008)
+        return
+
+    await manager.connect(websocket)
+    try:
+        while True:
+            symbol = await websocket.receive_text()
+            manager.subscribe(websocket, symbol)
+            await subscription_queue.put(symbol)
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
 
 if __name__ == "__main__":
     uvicorn.run(
